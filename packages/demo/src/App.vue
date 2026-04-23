@@ -17,6 +17,10 @@
           <el-tab-pane label="远程选择器" name="remote-select">
             <remote-select-demo />
           </el-tab-pane>
+
+          <el-tab-pane label="Schema Form" name="schema-form">
+            <schema-form-demo />
+          </el-tab-pane>
         </el-tabs>
       </el-card>
     </el-main>
@@ -26,12 +30,14 @@
 <script>
 import VirtualListDemo from "./components/VirtualListDemo.vue";
 import RemoteSelectDemo from "./components/RemoteSelectDemo.vue";
+import SchemaFormDemo from "./components/SchemaFormDemo.vue";
 
 export default {
   name: "App",
   components: {
     VirtualListDemo,
     RemoteSelectDemo,
+    SchemaFormDemo,
   },
   data() {
     return {
