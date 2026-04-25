@@ -6,12 +6,12 @@
     filterable
     remote
     :remote-method="handleRemoteSearch"
-    :loading="loading"
+    :loading="loading || loadingMore"
     @change="handleChange"
     @visible-change="handleVisibleChange"
   >
     <el-option
-      v-for="item in options"
+      v-for="item in mergedOptions"
       :key="getOptionKey(item)"
       :label="getOptionLabel(item)"
       :value="getOptionValue(item)"
@@ -21,6 +21,13 @@
         {{ getOptionLabel(item) }}
       </slot>
     </el-option>
+
+    <template v-if="pagination && hasMore && mergedOptions.length > 0" #footer>
+      <div class="remote-select-loading">
+        <el-icon class="is-loading"><Loading /></el-icon>
+        <span>加载中...</span>
+      </div>
+    </template>
 
     <template #empty>
       <div class="remote-select-empty">
@@ -39,32 +46,26 @@ export default {
   name: "RemoteSelect",
   inheritAttrs: false,
   props: {
-    // 选中的值
     value: {
       type: [String, Number, Array],
       default: "",
     },
-    // 远程搜索方法
     remoteMethod: {
       type: Function,
       required: true,
     },
-    // 选项列表
     options: {
       type: Array,
       default: () => [],
     },
-    // 防抖延迟时间（毫秒）
     debounce: {
       type: Number,
       default: 300,
     },
-    // 空状态文本
     emptyText: {
       type: String,
       default: "暂无数据",
     },
-    // 选项键名配置
     optionConfig: {
       type: Object,
       default: () => ({
@@ -74,15 +75,21 @@ export default {
         disabled: "disabled",
       }),
     },
-    // 是否启用缓存
     cache: {
       type: Boolean,
       default: true,
     },
-    // 初始加载数据
     initialLoad: {
       type: Boolean,
       default: false,
+    },
+    pagination: {
+      type: Boolean,
+      default: false,
+    },
+    pageSize: {
+      type: Number,
+      default: 20,
     },
   },
   data() {
@@ -90,9 +97,18 @@ export default {
       loading: false,
       selectedValue: this.value,
       searchCache: new Map(),
+      currentPage: 1,
+      hasMore: true,
+      currentQuery: "",
+      loadingMore: false,
+      internalOptions: [],
+      scrollHandler: null,
     };
   },
   computed: {
+    mergedOptions() {
+      return this.pagination ? this.internalOptions : this.options;
+    },
     debouncedSearch() {
       return debounce(this.performSearch, this.debounce);
     },
@@ -104,98 +120,192 @@ export default {
     selectedValue(newVal) {
       this.$emit("input", newVal);
     },
+    options: {
+      handler(newVal) {
+        if (!this.pagination) {
+          this.internalOptions = newVal;
+        }
+      },
+      immediate: true,
+    },
   },
   mounted() {
     if (this.initialLoad) {
       this.handleRemoteSearch("");
     }
   },
+  beforeDestroy() {
+    this.removeScrollListener();
+  },
   methods: {
-    // 获取选项键值
     getOptionKey(item) {
       return item[this.optionConfig.key] || item.value;
     },
 
-    // 获取选项显示文本
     getOptionLabel(item) {
       return item[this.optionConfig.label] || item.label || item.value;
     },
 
-    // 获取选项值
     getOptionValue(item) {
       return item[this.optionConfig.value] || item.value;
     },
 
-    // 判断选项是否禁用
     isOptionDisabled(item) {
       return item[this.optionConfig.disabled] || item.disabled || false;
     },
 
-    // 处理远程搜索
     handleRemoteSearch(query) {
-      this.debouncedSearch(query);
+      if (this.pagination) {
+        this.currentQuery = query;
+        this.currentPage = 1;
+        this.hasMore = true;
+        this.internalOptions = [];
+      }
+      this.debouncedSearch(query, this.pagination ? 1 : undefined);
     },
 
-    // 执行搜索
-    async performSearch(query) {
-      debugger;
-      if (this.cache && this.searchCache.has(query)) {
-        const cachedData = this.searchCache.get(query);
-        this.$emit("update:options", cachedData);
-        return;
+    async performSearch(query, page = 1) {
+      if (!this.pagination) {
+        if (this.cache && this.searchCache.has(query)) {
+          const cachedData = this.searchCache.get(query);
+          this.$emit("update:options", cachedData);
+          return;
+        }
       }
 
-      this.loading = true;
+      this.loading = page === 1;
+      this.loadingMore = page > 1;
 
       try {
-        const result = await this.remoteMethod(query);
+        let result;
+        if (this.pagination) {
+          result = await this.remoteMethod(query, page, this.pageSize);
+          const list = Array.isArray(result) ? result : result.list || [];
+          const hasMore =
+            result.hasMore !== undefined
+              ? result.hasMore
+              : list.length >= this.pageSize;
 
-        if (this.cache) {
-          this.searchCache.set(query, result);
+          if (page === 1) {
+            this.internalOptions = list;
+          } else {
+            this.internalOptions = [...this.internalOptions, ...list];
+          }
+          this.hasMore = hasMore;
+          this.currentPage = page;
+
+          this.$emit("update:options", this.internalOptions);
+          this.$emit("search", query, this.internalOptions, { page, hasMore });
+        } else {
+          result = await this.remoteMethod(query);
+          if (this.cache) {
+            this.searchCache.set(query, result);
+          }
+          this.$emit("update:options", result);
+          this.$emit("search", query, result);
         }
-
-        this.$emit("update:options", result);
-        this.$emit("search", query, result);
       } catch (error) {
         this.$emit("error", error);
         console.error("RemoteSelect search error:", error);
       } finally {
         this.loading = false;
+        this.loadingMore = false;
       }
     },
 
-    // 处理选择变化
+    async loadMore() {
+      if (!this.pagination || !this.hasMore || this.loadingMore) {
+        return;
+      }
+      await this.performSearch(this.currentQuery, this.currentPage + 1);
+    },
+
+    setupScrollListener() {
+      this.$nextTick(() => {
+        const selectEl = this.$refs.selectRef;
+        if (!selectEl) return;
+
+        const popperEl =
+          selectEl.popperElm || selectEl.$el?.closest?.(".el-popper");
+        if (!popperEl) return;
+
+        const dropdown = popperEl.querySelector(".el-select-dropdown__wrap");
+        if (dropdown && !this.scrollHandler) {
+          this.scrollHandler = this.handleScroll.bind(this);
+          dropdown.addEventListener("scroll", this.scrollHandler);
+        }
+      });
+    },
+
+    removeScrollListener() {
+      if (this.scrollHandler) {
+        const selectEl = this.$refs.selectRef;
+        if (selectEl) {
+          const popperEl =
+            selectEl.popperElm || selectEl.$el?.closest?.(".el-popper");
+          if (popperEl) {
+            const dropdown = popperEl.querySelector(
+              ".el-select-dropdown__wrap",
+            );
+            if (dropdown) {
+              dropdown.removeEventListener("scroll", this.scrollHandler);
+            }
+          }
+        }
+        this.scrollHandler = null;
+      }
+    },
+
+    handleScroll(event) {
+      const target = event.target;
+      const scrollTop = target.scrollTop;
+      const scrollHeight = target.scrollHeight;
+      const clientHeight = target.clientHeight;
+
+      if (scrollHeight - scrollTop - clientHeight < 50) {
+        this.loadMore();
+      }
+    },
+
+    handleVisibleChange(visible) {
+      this.$emit("visible-change", visible);
+
+      if (visible && this.pagination) {
+        this.setupScrollListener();
+      } else if (!visible) {
+        this.removeScrollListener();
+      }
+    },
+
     handleChange(value) {
-      const selectedOption = this.options.find(
+      const selectedOption = this.mergedOptions.find(
         (option) => this.getOptionValue(option) === value,
       );
       this.$emit("change", value, selectedOption);
     },
 
-    // 处理下拉框显示/隐藏
-    handleVisibleChange(visible) {
-      this.$emit("visible-change", visible);
-    },
-
-    // 清空缓存
     clearCache() {
       this.searchCache.clear();
     },
 
-    // 清空选择
     clear() {
       this.selectedValue = "";
       this.$refs.selectRef?.blur();
     },
 
-    // 聚焦
     focus() {
       this.$refs.selectRef?.focus();
     },
 
-    // 失焦
     blur() {
       this.$refs.selectRef?.blur();
+    },
+
+    resetPagination() {
+      this.currentPage = 1;
+      this.hasMore = true;
+      this.currentQuery = "";
+      this.internalOptions = [];
     },
   },
 };
@@ -206,5 +316,24 @@ export default {
   padding: 10px 0;
   text-align: center;
   color: #909399;
+}
+.remote-select-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 0;
+  color: #909399;
+  gap: 6px;
+}
+.remote-select-loading .el-icon {
+  animation: rotating 2s linear infinite;
+}
+@keyframes rotating {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>
